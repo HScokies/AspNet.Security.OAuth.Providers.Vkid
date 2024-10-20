@@ -19,38 +19,30 @@ using Base64UrlEncoder = Microsoft.AspNetCore.Authentication.Base64UrlTextEncode
 
 namespace AspNet.Security.OAuth.VkId;
 
-public sealed class VkIdAuthenticationHandler : OAuthHandler<VkIdAuthenticationOptions>
+public sealed class VkIdAuthenticationHandler(
+    IOptionsMonitor<VkIdAuthenticationOptions> options,
+    ILoggerFactory logger,
+    UrlEncoder encoder)
+    : OAuthHandler<VkIdAuthenticationOptions>(options, logger, encoder)
 {
-    [Obsolete("Obsolete")]
-    public VkIdAuthenticationHandler(IOptionsMonitor<VkIdAuthenticationOptions> options, ILoggerFactory logger, UrlEncoder encoder, ISystemClock clock)
-        : base(options, logger, encoder, clock)
-    {
-    }
-
-    public VkIdAuthenticationHandler(IOptionsMonitor<VkIdAuthenticationOptions> options, ILoggerFactory logger, UrlEncoder encoder)
-        : base(options, logger, encoder)
-    {
-    }
-
     protected override string BuildChallengeUrl(AuthenticationProperties properties, string redirectUri)
     {
         var parameter = Options.Scope;
         var scopes = FormatScope(parameter);
 
-        var data = new byte[32];
-        RandomNumberGenerator.Fill((Span<byte>)data);
+        var data = RandomNumberGenerator.GetBytes(32);
         var codeVerifierKey = Base64UrlEncoder.Encode(data);
         properties.Items.Add(OAuthConstants.CodeVerifierKey, codeVerifierKey);
 
         var query = new Dictionary<string, string?>
         {
-            { "response_type", "code" },
-            { "client_id", Options.ClientId },
-            { "scope", scopes },
-            { "redirect_uri", redirectUri },
-            { "state", Options.StateDataFormat.Protect(properties) },
-            { "code_challenge", WebEncoders.Base64UrlEncode(SHA256.HashData(Encoding.UTF8.GetBytes(codeVerifierKey))) },
-            { "code_challenge_method", OAuthConstants.CodeChallengeMethodS256 },
+            ["response_type"] = "code",
+            ["client_id"] = Options.ClientId,
+            ["scope"] = scopes,
+            ["redirect_uri"] = redirectUri,
+            ["state"] = Options.StateDataFormat.Protect(properties),
+            ["code_challenge"] = WebEncoders.Base64UrlEncode(SHA256.HashData(Encoding.UTF8.GetBytes(codeVerifierKey))),
+            ["code_challenge_method"] = OAuthConstants.CodeChallengeMethodS256
         };
         return QueryHelpers.AddQueryString(Options.AuthorizationEndpoint, query);
     }
@@ -60,24 +52,24 @@ public sealed class VkIdAuthenticationHandler : OAuthHandler<VkIdAuthenticationO
         var properties = Options.StateDataFormat.Unprotect(Request.Query["state"]);
         if (properties is null)
         {
-            return HandleRequestResult.Fail(VkIdAuthenticationErrors.InvalidOAuthState);
+            return HandleRequestResult.Fail("The oauth state was missing or invalid.");
         }
 
         if (ValidateCorrelationId(properties) is false)
         {
-            return HandleRequestResult.Fail(VkIdAuthenticationErrors.CorrelationFailed);
+            return HandleRequestResult.Fail("Correlation failed.");
         }
 
         var code = Request.Query["code"];
         if (StringValues.IsNullOrEmpty(code))
         {
-            return HandleRequestResult.Fail(VkIdAuthenticationErrors.MissingCode);
+            return HandleRequestResult.Fail("Code was not found.");
         }
 
         var deviceId = Request.Query["device_id"];
         if (StringValues.IsNullOrEmpty(deviceId))
         {
-            return HandleRequestResult.Fail(VkIdAuthenticationErrors.MissingDeviceId);
+            return HandleRequestResult.Fail("DeviceId was not found.");
         }
 
         properties.Items.Add(VkIdAuthenticationConstants.AuthenticationProperties.DeviceId, deviceId);
@@ -91,12 +83,12 @@ public sealed class VkIdAuthenticationHandler : OAuthHandler<VkIdAuthenticationO
 
         if (string.IsNullOrEmpty(tokens.AccessToken))
         {
-            return HandleRequestResult.Fail(VkIdAuthenticationErrors.MissingAccessToken, properties);
+            return HandleRequestResult.Fail("Failed to retrieve access_token.", properties);
         }
 
         if (string.IsNullOrEmpty(tokens.RefreshToken))
         {
-            return HandleRequestResult.Fail(VkIdAuthenticationErrors.MissingRefreshToken, properties);
+            return HandleRequestResult.Fail("Failed to retrieve refresh_token.", properties);
         }
 
         if (Options.SaveTokens)
@@ -119,7 +111,7 @@ public sealed class VkIdAuthenticationHandler : OAuthHandler<VkIdAuthenticationO
 
             if (int.TryParse(tokens.ExpiresIn, NumberStyles.Integer, CultureInfo.InvariantCulture, out var expiresIn))
             {
-                var expiresAt = TimeProvider.GetUtcNow() + TimeSpan.FromSeconds(expiresIn);
+                var expiresAt = TimeProvider.GetUtcNow().AddSeconds(expiresIn);
                 tokensToStore.Add(new AuthenticationToken
                 {
                     Name = "expires_at", Value = expiresAt.ToString("o", CultureInfo.InvariantCulture)
@@ -136,29 +128,28 @@ public sealed class VkIdAuthenticationHandler : OAuthHandler<VkIdAuthenticationO
 
     protected override async Task<OAuthTokenResponse> ExchangeCodeAsync(OAuthCodeExchangeContext context)
     {
-        if (!context.Properties.Items.TryGetValue(VkIdAuthenticationConstants.AuthenticationProperties.DeviceId,
-                out var deviceId) ||
+        if (!context.Properties.Items.TryGetValue(VkIdAuthenticationConstants.AuthenticationProperties.DeviceId, out var deviceId) ||
             string.IsNullOrEmpty(deviceId))
         {
-            return OAuthTokenResponse.Failed(new Exception(VkIdAuthenticationErrors.MissingDeviceId));
+            return OAuthTokenResponse.Failed(new Exception("Code verifier key was not found."));
         }
 
         if (!context.Properties.Items.TryGetValue(OAuthConstants.CodeVerifierKey, out var codeVerifier) ||
             string.IsNullOrEmpty(codeVerifier))
         {
-            return OAuthTokenResponse.Failed(new Exception(VkIdAuthenticationErrors.MissingCodeVerifierKey));
+            return OAuthTokenResponse.Failed(new Exception("Code verifier key was not found."));
         }
 
         context.Properties.Items.Remove(OAuthConstants.CodeVerifierKey);
         var query = new Dictionary<string, string>()
         {
-            { "grant_type", "authorization_code" },
-            { "code", context.Code },
-            { "code_verifier", codeVerifier },
-            { "client_id", Options.ClientId },
-            { "device_id", deviceId },
-            { "redirect_uri", context.RedirectUri },
-            { "state", Options.StateDataFormat.Protect(context.Properties) },
+            ["grant_type"] = "authorization_code",
+            ["code"] = context.Code,
+            ["code_verifier"] = codeVerifier,
+            ["client_id"] = Options.ClientId,
+            ["device_id"] = deviceId,
+            ["redirect_uri"] = context.RedirectUri,
+            ["state"] = Options.StateDataFormat.Protect(context.Properties),
         };
 
         using var request = new HttpRequestMessage(HttpMethod.Post, Options.TokenEndpoint);
@@ -167,11 +158,11 @@ public sealed class VkIdAuthenticationHandler : OAuthHandler<VkIdAuthenticationO
         request.Version = Backchannel.DefaultRequestVersion;
 
         var response = await Backchannel.SendAsync(request, Context.RequestAborted);
-        var payload = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var payload = JsonDocument.Parse(await response.Content.ReadAsStringAsync(Context.RequestAborted));
         if (!payload.RootElement.TryGetProperty("state", out var state) ||
             Options.StateDataFormat.Unprotect(state.GetString()) is null)
         {
-            return OAuthTokenResponse.Failed(new Exception(VkIdAuthenticationErrors.InvalidOAuthState));
+            return OAuthTokenResponse.Failed(new Exception("The oauth state was missing or invalid."));
         }
 
         if (!payload.RootElement.TryGetProperty("error", out var errorElement))
@@ -188,7 +179,8 @@ public sealed class VkIdAuthenticationHandler : OAuthHandler<VkIdAuthenticationO
     {
         var query = new Dictionary<string, string>
         {
-            { "access_token", tokens.AccessToken! }, { "client_id", Options.ClientId }
+            ["access_token"] = tokens.AccessToken!,
+            ["client_id"] = Options.ClientId
         };
         using var request = new HttpRequestMessage(HttpMethod.Post, Options.UserInformationEndpoint);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
@@ -196,7 +188,7 @@ public sealed class VkIdAuthenticationHandler : OAuthHandler<VkIdAuthenticationO
         request.Version = Backchannel.DefaultRequestVersion;
 
         var response = await Backchannel.SendAsync(request, Context.RequestAborted);
-        var content = await response.Content.ReadAsStringAsync();
+        var content = await response.Content.ReadAsStringAsync(Context.RequestAborted);
         var body = JsonDocument.Parse(content);
 
         if (body.RootElement.TryGetProperty("error", out var errorElement))
@@ -208,7 +200,7 @@ public sealed class VkIdAuthenticationHandler : OAuthHandler<VkIdAuthenticationO
 
         if (!body.RootElement.TryGetProperty("user", out var payload))
         {
-            throw new Exception(VkIdAuthenticationErrors.FailedToRetrieveUserInfo);
+            throw new Exception("Failed to retrieve user information.");
         }
 
         var principal = new ClaimsPrincipal(identity);
